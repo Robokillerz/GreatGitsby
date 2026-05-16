@@ -1,0 +1,1347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>K+YRGB Pro String Art Solver</title>
+
+<style>
+body{
+  margin:0;
+  background:#0f172a;
+  color:white;
+  font-family:Arial,sans-serif;
+  text-align:center;
+}
+
+h2{
+  margin:14px 0 4px;
+}
+
+.small{
+  color:#cbd5e1;
+  font-size:13px;
+  margin:6px;
+}
+
+.controls{
+  background:#1e293b;
+  padding:10px;
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:center;
+  gap:6px;
+}
+
+input,button,select{
+  padding:6px;
+  border-radius:8px;
+  border:1px solid #64748b;
+}
+
+button{
+  background:#2563eb;
+  color:white;
+  font-weight:bold;
+  cursor:pointer;
+}
+
+button.stop{
+  background:#991b1b;
+}
+
+button.good{
+  background:#166534;
+}
+
+.wrapper{
+  width:90vw;
+  max-width:620px;
+  aspect-ratio:1/1;
+  margin:18px auto;
+  position:relative;
+  background:white;
+  border-radius:50%;
+  overflow:hidden;
+  touch-action:none;
+}
+
+.wrapper.square{
+  border-radius:0;
+}
+
+canvas{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  display:block;
+}
+
+#src{
+  z-index:1;
+  background:white;
+}
+
+#art{
+  z-index:2;
+  pointer-events:none;
+}
+
+#pinsCanvas{
+  z-index:3;
+  pointer-events:none;
+}
+
+#progress{
+  width:90vw;
+  max-width:620px;
+  height:14px;
+  background:#020617;
+  border-radius:999px;
+  margin:8px auto;
+  overflow:hidden;
+}
+
+#bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#22c55e,#38bdf8);
+}
+
+#instructions{
+  width:90vw;
+  max-width:620px;
+  height:250px;
+  background:#020617;
+  color:#22c55e;
+  font-family:Consolas,monospace;
+  font-size:12px;
+  white-space:pre;
+  text-align:left;
+  overflow:auto;
+  border-radius:10px;
+  padding:8px;
+}
+</style>
+</head>
+
+<body>
+
+<h2>K+YRGB Pro Optical String Art Solver</h2>
+<div class="small">
+Black + Yellow + Red + Green + Blue optical blending with edge scoring, density control, continuous passes, circle/square canvas, and Android-safe export.
+</div>
+
+<div class="controls">
+  <input type="file" id="file" accept="image/*">
+  <button onclick="fitImage()">Fit Image</button>
+
+  <label>Canvas
+    <select id="canvasShape" onchange="setCanvasShape()">
+      <option value="circle">Circle</option>
+      <option value="square">Square</option>
+    </select>
+  </label>
+
+  <label>Pins
+    <input id="pinCount" type="number" value="300" min="80" max="900">
+  </label>
+
+  <label>Lines
+    <input id="lineCount" type="number" value="6500" min="500" max="22000">
+  </label>
+
+  <label>Candidates
+    <input id="candidateCount" type="number" value="260" min="40" max="900">
+  </label>
+
+  <label>Gap
+    <input id="gap" type="number" value="12" min="2" max="80">
+  </label>
+
+  <label>Thread Width
+    <input id="threadWidth" type="number" value="0.65" min="0.2" max="3" step="0.05">
+  </label>
+
+  <label>Opacity
+    <input id="opacity" type="number" value="0.12" min="0.03" max="0.35" step="0.01">
+  </label>
+
+  <button class="good" onclick="start()">Generate</button>
+  <button class="stop" onclick="stopRun()">Stop</button>
+  <button onclick="resetAll()">Reset</button>
+  <button onclick="downloadPNG()">PNG</button>
+  <button onclick="downloadSVG()">SVG</button>
+  <button onclick="downloadTXT()">TXT</button>
+</div>
+
+<div class="wrapper" id="wrap">
+  <canvas id="src" width="620" height="620"></canvas>
+  <canvas id="art" width="620" height="620"></canvas>
+  <canvas id="pinsCanvas" width="620" height="620"></canvas>
+</div>
+
+<div id="progress"><div id="bar"></div></div>
+<div id="status" class="small">Upload an image.</div>
+<div id="instructions"></div>
+
+<script>
+const SIZE=620;
+const WORK=210;
+const GAMMA=0.82;
+
+const BASE_STRENGTH=0.028;
+const K_POWER=0.82;
+const COLOR_POWER=0.92;
+
+const EDGE_BOOST=7.5;
+const DARK_EDGE_BOOST=2.25;
+const DENSITY_PENALTY=0.0045;
+const COLOR_DENSITY_PENALTY=0.008;
+const WRONG_COLOR_PENALTY=115;
+const YELLOW_WRONG_PENALTY=150;
+const CENTER_WEIGHT=1.35;
+
+const RECENT_MEMORY=12;
+const RECENT_PIN_PENALTY=0.18;
+const SHARP_TURN_PENALTY=0.38;
+const NEAR_REVERSE_DOT=-0.18;
+
+const src=document.getElementById("src");
+const art=document.getElementById("art");
+const pinsCanvas=document.getElementById("pinsCanvas");
+const wrap=document.getElementById("wrap");
+
+const sctx=src.getContext("2d",{willReadFrequently:true});
+const actx=art.getContext("2d",{willReadFrequently:true});
+const pctx=pinsCanvas.getContext("2d");
+
+const statusEl=document.getElementById("status");
+const bar=document.getElementById("bar");
+const instructionBox=document.getElementById("instructions");
+
+let rawImage=null;
+let ready=false;
+let running=false;
+let stopFlag=false;
+
+let view={x:0,y:0,z:1};
+let drag=null;
+let pinch=null;
+
+let pins=[];
+let targetRGB=null;
+
+let K=null;
+let Y=null;
+let R=null;
+let G=null;
+let B=null;
+
+let density=null;
+let densityK=null;
+let densityY=null;
+let densityR=null;
+let densityG=null;
+let densityB=null;
+
+let edgeMap=null;
+let mask=null;
+
+let lineCache=new Map();
+let log=[];
+let svgLines=[];
+
+function isSquareMode(){
+  const sel=document.getElementById("canvasShape");
+  return sel&&sel.value==="square";
+}
+
+function setCanvasShape(){
+  if(isSquareMode()){
+    wrap.classList.add("square");
+  }else{
+    wrap.classList.remove("square");
+  }
+
+  resetArtOnly();
+  buildPins();
+  drawPins();
+
+  if(ready){
+    showSource();
+    drawSource();
+    statusEl.textContent=isSquareMode()
+      ? "Square canvas selected. Pin 0 is upper-left. Pins run clockwise."
+      : "Circle canvas selected. Pin 0 is at top. Pins run clockwise.";
+  }
+}
+
+function showSource(){
+  src.style.display="block";
+}
+
+function hideSource(){
+  src.style.display="none";
+}
+
+document.getElementById("file").addEventListener("change",e=>{
+  const file=e.target.files[0];
+  if(!file)return;
+
+  const url=URL.createObjectURL(file);
+  const img=new Image();
+
+  img.onload=()=>{
+    rawImage=img;
+    ready=true;
+    fitImage();
+    resetArtOnly();
+    buildPins();
+    drawPins();
+    statusEl.textContent="Image loaded. Drag to move, pinch/wheel to zoom, then Generate.";
+    URL.revokeObjectURL(url);
+  };
+
+  img.onerror=()=>{
+    alert("Image failed to load.");
+    URL.revokeObjectURL(url);
+  };
+
+  img.src=url;
+});
+
+function fitImage(){
+  showSource();
+
+  if(!rawImage)return;
+
+  const scale=Math.max(SIZE/rawImage.width,SIZE/rawImage.height);
+
+  view.z=scale;
+  view.x=(SIZE-rawImage.width*scale)/2;
+  view.y=(SIZE-rawImage.height*scale)/2;
+
+  drawSource();
+}
+
+function drawSource(){
+  sctx.clearRect(0,0,SIZE,SIZE);
+  sctx.fillStyle="white";
+  sctx.fillRect(0,0,SIZE,SIZE);
+
+  if(rawImage){
+    sctx.drawImage(
+      rawImage,
+      view.x,
+      view.y,
+      rawImage.width*view.z,
+      rawImage.height*view.z
+    );
+  }
+}
+
+wrap.addEventListener("pointerdown",e=>{
+  if(!ready||running)return;
+
+  wrap.setPointerCapture(e.pointerId);
+
+  drag={
+    id:e.pointerId,
+    x:e.clientX,
+    y:e.clientY,
+    vx:view.x,
+    vy:view.y
+  };
+});
+
+wrap.addEventListener("pointermove",e=>{
+  if(!drag||drag.id!==e.pointerId||running)return;
+
+  const r=wrap.getBoundingClientRect();
+  const k=SIZE/r.width;
+
+  view.x=drag.vx+(e.clientX-drag.x)*k;
+  view.y=drag.vy+(e.clientY-drag.y)*k;
+
+  drawSource();
+});
+
+wrap.addEventListener("pointerup",()=>{
+  drag=null;
+});
+
+wrap.addEventListener("pointercancel",()=>{
+  drag=null;
+});
+
+wrap.addEventListener("wheel",e=>{
+  if(!ready||running)return;
+
+  e.preventDefault();
+
+  const r=wrap.getBoundingClientRect();
+
+  const mx=(e.clientX-r.left)*SIZE/r.width;
+  const my=(e.clientY-r.top)*SIZE/r.height;
+
+  const old=view.z;
+  const f=e.deltaY<0?1.08:0.925;
+
+  view.z=Math.max(0.04,Math.min(25,view.z*f));
+
+  view.x=mx-(mx-view.x)*(view.z/old);
+  view.y=my-(my-view.y)*(view.z/old);
+
+  drawSource();
+},{passive:false});
+
+wrap.addEventListener("touchstart",e=>{
+  if(!ready||running)return;
+
+  if(e.touches.length===2){
+    const a=e.touches[0];
+    const b=e.touches[1];
+    const r=wrap.getBoundingClientRect();
+
+    pinch={
+      d:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY),
+      z:view.z,
+      x:view.x,
+      y:view.y,
+      mx:((a.clientX+b.clientX)/2-r.left)*SIZE/r.width,
+      my:((a.clientY+b.clientY)/2-r.top)*SIZE/r.height
+    };
+  }
+},{passive:true});
+
+wrap.addEventListener("touchmove",e=>{
+  if(!ready||running||!pinch||e.touches.length!==2)return;
+
+  e.preventDefault();
+
+  const a=e.touches[0];
+  const b=e.touches[1];
+  const r=wrap.getBoundingClientRect();
+
+  const mx=((a.clientX+b.clientX)/2-r.left)*SIZE/r.width;
+  const my=((a.clientY+b.clientY)/2-r.top)*SIZE/r.height;
+
+  const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+
+  view.z=Math.max(0.04,Math.min(25,pinch.z*(d/pinch.d)));
+
+  view.x=mx-(pinch.mx-pinch.x)*(view.z/pinch.z);
+  view.y=my-(pinch.my-pinch.y)*(view.z/pinch.z);
+
+  drawSource();
+},{passive:false});
+
+wrap.addEventListener("touchend",e=>{
+  if(e.touches.length<2){
+    pinch=null;
+  }
+},{passive:true});
+
+function resetArtOnly(){
+  actx.clearRect(0,0,SIZE,SIZE);
+  bar.style.width="0%";
+  instructionBox.textContent="";
+  log=[];
+  svgLines=[];
+}
+
+function resetAll(){
+  running=false;
+  stopFlag=true;
+
+  resetArtOnly();
+
+  showSource();
+  drawSource();
+  drawPins();
+
+  statusEl.textContent=ready
+    ? "Image visible. Adjust or generate."
+    : "Upload an image.";
+}
+
+function getPinCount(){
+  let count=parseInt(document.getElementById("pinCount").value);
+
+  if(isNaN(count)){
+    count=300;
+  }
+
+  count=Math.max(80,Math.min(900,count));
+
+  if(isSquareMode()){
+    count=Math.round(count/4)*4;
+
+    if(count<80){
+      count=80;
+    }
+
+    document.getElementById("pinCount").value=count;
+  }
+
+  return count;
+}
+
+function buildPins(){
+  pins=[];
+
+  const count=getPinCount();
+
+  if(isSquareMode()){
+    const margin=SIZE*0.02;
+    const min=margin;
+    const max=SIZE-margin;
+    const side=count/4;
+
+    for(let i=0;i<count;i++){
+      const sideIndex=Math.floor(i/side);
+      const local=i%side;
+      const t=local/side;
+
+      let x=min;
+      let y=min;
+
+      if(sideIndex===0){
+        x=min+t*(max-min);
+        y=min;
+      }else if(sideIndex===1){
+        x=max;
+        y=min+t*(max-min);
+      }else if(sideIndex===2){
+        x=max-t*(max-min);
+        y=max;
+      }else{
+        x=min;
+        y=max-t*(max-min);
+      }
+
+      pins.push({x,y});
+    }
+  }else{
+    const cx=SIZE/2;
+    const cy=SIZE/2;
+    const r=SIZE*0.48;
+
+    for(let i=0;i<count;i++){
+      const a=-Math.PI/2+i*Math.PI*2/count;
+
+      pins.push({
+        x:cx+Math.cos(a)*r,
+        y:cy+Math.sin(a)*r
+      });
+    }
+  }
+
+  lineCache.clear();
+}
+
+function drawPins(){
+  pctx.clearRect(0,0,SIZE,SIZE);
+  pctx.fillStyle="#0f172a";
+  pctx.font="15px Arial";
+
+  for(let i=0;i<pins.length;i++){
+    const p=pins[i];
+
+    pctx.beginPath();
+    pctx.arc(p.x,p.y,i===0?4:2,0,Math.PI*2);
+    pctx.fill();
+
+    if(i===0){
+      pctx.fillStyle="red";
+      pctx.fillText("0",p.x+6,p.y+15);
+      pctx.fillStyle="#0f172a";
+    }
+  }
+}
+
+function validShape(x,y){
+  if(isSquareMode()){
+    return x>=0&&y>=0&&x<SIZE&&y<SIZE;
+  }
+
+  const dx=x-SIZE/2;
+  const dy=y-SIZE/2;
+
+  return dx*dx+dy*dy<(SIZE*0.48)*(SIZE*0.48);
+}
+
+function prepareTarget(){
+  drawSource();
+
+  const data=sctx.getImageData(0,0,SIZE,SIZE).data;
+
+  targetRGB=new Float32Array(WORK*WORK*3);
+
+  K=new Float32Array(WORK*WORK);
+  Y=new Float32Array(WORK*WORK);
+  R=new Float32Array(WORK*WORK);
+  G=new Float32Array(WORK*WORK);
+  B=new Float32Array(WORK*WORK);
+
+  density=new Float32Array(WORK*WORK);
+  densityK=new Float32Array(WORK*WORK);
+  densityY=new Float32Array(WORK*WORK);
+  densityR=new Float32Array(WORK*WORK);
+  densityG=new Float32Array(WORK*WORK);
+  densityB=new Float32Array(WORK*WORK);
+
+  edgeMap=new Float32Array(WORK*WORK);
+  mask=new Uint8Array(WORK*WORK);
+
+  const scale=SIZE/WORK;
+
+  for(let y=0;y<WORK;y++){
+    for(let x=0;x<WORK;x++){
+      const sx=Math.floor((x+0.5)*scale);
+      const sy=Math.floor((y+0.5)*scale);
+
+      const si=(sy*SIZE+sx)*4;
+      const id=y*WORK+x;
+      const ti=id*3;
+
+      mask[id]=validShape(sx,sy)?1:0;
+
+      targetRGB[ti]=255*Math.pow(data[si]/255,GAMMA);
+      targetRGB[ti+1]=255*Math.pow(data[si+1]/255,GAMMA);
+      targetRGB[ti+2]=255*Math.pow(data[si+2]/255,GAMMA);
+    }
+  }
+
+  computeEdgeMap();
+}
+
+function lumAt(x,y){
+  const i=(y*WORK+x)*3;
+
+  return targetRGB[i]*0.2126+
+         targetRGB[i+1]*0.7152+
+         targetRGB[i+2]*0.0722;
+}
+
+function computeEdgeMap(){
+  for(let y=1;y<WORK-1;y++){
+    for(let x=1;x<WORK-1;x++){
+      const id=y*WORK+x;
+
+      if(!mask[id])continue;
+
+      const gx=lumAt(x+1,y)-lumAt(x-1,y);
+      const gy=lumAt(x,y+1)-lumAt(x,y-1);
+
+      edgeMap[id]=Math.pow(
+        Math.min(1,Math.sqrt(gx*gx+gy*gy)/255),
+        0.75
+      );
+    }
+  }
+}
+
+function colorNeeds(idx){
+  const ti=idx*3;
+
+  const tr=targetRGB[ti];
+  const tg=targetRGB[ti+1];
+  const tb=targetRGB[ti+2];
+
+  const lum=(tr+tg+tb)/765;
+  const darkness=1-lum;
+
+  const maxC=Math.max(tr,tg,tb);
+  const minC=Math.min(tr,tg,tb);
+  const saturation=(maxC-minC)/255;
+
+  const redNeed=Math.max(0,tr-Math.max(tg,tb))/255;
+  const greenNeed=Math.max(0,tg-Math.max(tr,tb))/255;
+  const blueNeed=Math.max(0,tb-Math.max(tr,tg))/255;
+
+  const warmRG=Math.min(tr,tg)/255;
+  const blueSuppress=1-(tb/255)*0.75;
+  const yellowNeed=Math.max(0,warmRG*blueSuppress)*(0.35+saturation*0.65);
+
+  return {
+    tr,
+    tg,
+    tb,
+    lum,
+    darkness,
+    saturation,
+    redNeed,
+    greenNeed,
+    blueNeed,
+    yellowNeed
+  };
+}
+
+function clamp(i){
+  K[i]=Math.max(0,Math.min(0.95,K[i]));
+  Y[i]=Math.max(0,Math.min(0.72,Y[i]));
+  R[i]=Math.max(0,Math.min(0.88,R[i]));
+  G[i]=Math.max(0,Math.min(0.88,G[i]));
+  B[i]=Math.max(0,Math.min(0.88,B[i]));
+}
+
+function reconstructRGB(i){
+  let k=Math.pow(K[i],K_POWER);
+  let yD=Math.pow(Y[i],COLOR_POWER);
+  let rD=Math.pow(R[i],COLOR_POWER);
+  let gD=Math.pow(G[i],COLOR_POWER);
+  let bD=Math.pow(B[i],COLOR_POWER);
+
+  let sum=yD+rD+gD+bD;
+  let limit=Math.min(1,1/(1+Math.max(0,sum-1.05)*0.78));
+
+  yD*=limit;
+  rD*=limit;
+  gD*=limit;
+  bD*=limit;
+
+  let base=255*(1-k);
+
+  let r=base;
+  let g=base;
+  let b=base;
+
+  r=r*(1-yD)+255*yD;
+  g=g*(1-yD)+232*yD;
+  b=b*(1-yD)+38*yD;
+
+  r=r*(1-rD)+255*rD;
+  g=g*(1-rD)+38*rD;
+  b=b*(1-rD)+34*rD;
+
+  r=r*(1-gD)+38*gD;
+  g=g*(1-gD)+220*gD;
+  b=b*(1-gD)+58*gD;
+
+  r=r*(1-bD)+42*bD;
+  g=g*(1-bD)+82*bD;
+  b=b*(1-bD)+255*bD;
+
+  let crowd=Math.min(0.42,(yD+rD+gD+bD)*0.22);
+
+  r*=1-crowd;
+  g*=1-crowd;
+  b*=1-crowd;
+
+  return [r,g,b];
+}
+
+function applyPixel(idx,type,forward){
+  const mult=forward?1:-1;
+  const need=colorNeeds(idx);
+  const base=parseFloat(document.getElementById("opacity").value)*BASE_STRENGTH/0.12;
+
+  if(type==="K"){
+    K[idx]+=mult*base*1.12*(1+need.darkness*0.75);
+  }
+
+  if(type==="Y"){
+    Y[idx]+=mult*base*0.70*(1+need.yellowNeed*1.45+need.saturation*0.18);
+  }
+
+  if(type==="R"){
+    R[idx]+=mult*base*0.95*(1+need.redNeed*1.35+need.saturation*0.25);
+  }
+
+  if(type==="G"){
+    G[idx]+=mult*base*0.94*(1+need.greenNeed*1.35+need.saturation*0.25);
+  }
+
+  if(type==="B"){
+    B[idx]+=mult*base*1.02*(1+need.blueNeed*1.35+need.saturation*0.25);
+  }
+
+  if(type==="F"){
+    K[idx]+=mult*base*0.52*(1+edgeMap[idx]*0.95)*(1+need.darkness*0.95);
+  }
+
+  clamp(idx);
+}
+
+function wrongColorPenalty(type,idx){
+  const n=colorNeeds(idx);
+
+  if(type==="Y"){
+    const misuse=Math.max(0,(n.blueNeed*1.2+n.darkness*0.2)-n.yellowNeed);
+    return misuse*YELLOW_WRONG_PENALTY;
+  }
+
+  if(type==="R"){
+    return Math.max(0,n.greenNeed+n.blueNeed-n.redNeed)*WRONG_COLOR_PENALTY;
+  }
+
+  if(type==="G"){
+    return Math.max(0,n.redNeed+n.blueNeed-n.greenNeed)*WRONG_COLOR_PENALTY;
+  }
+
+  if(type==="B"){
+    return Math.max(0,n.redNeed+n.greenNeed-n.blueNeed)*WRONG_COLOR_PENALTY;
+  }
+
+  return 0;
+}
+
+function densityPenalty(type,idx){
+  let p=Math.pow(density[idx],1.12)*DENSITY_PENALTY;
+
+  if(type==="K"||type==="F"){
+    p+=Math.pow(densityK[idx],1.1)*COLOR_DENSITY_PENALTY*0.75;
+  }
+
+  if(type==="Y"){
+    p+=Math.pow(densityY[idx],1.2)*COLOR_DENSITY_PENALTY*1.35;
+  }
+
+  if(type==="R"){
+    p+=Math.pow(densityR[idx],1.15)*COLOR_DENSITY_PENALTY;
+  }
+
+  if(type==="G"){
+    p+=Math.pow(densityG[idx],1.15)*COLOR_DENSITY_PENALTY;
+  }
+
+  if(type==="B"){
+    p+=Math.pow(densityB[idx],1.15)*COLOR_DENSITY_PENALTY;
+  }
+
+  return p;
+}
+
+function lineScore(type,pixels){
+  let score=0;
+
+  for(const idx of pixels){
+    const ti=idx*3;
+
+    const oldRGB=reconstructRGB(idx);
+
+    const oldErr=
+      (targetRGB[ti]-oldRGB[0])**2+
+      (targetRGB[ti+1]-oldRGB[1])**2+
+      (targetRGB[ti+2]-oldRGB[2])**2;
+
+    applyPixel(idx,type,true);
+
+    const newRGB=reconstructRGB(idx);
+
+    const newErr=
+      (targetRGB[ti]-newRGB[0])**2+
+      (targetRGB[ti+1]-newRGB[1])**2+
+      (targetRGB[ti+2]-newRGB[2])**2;
+
+    applyPixel(idx,type,false);
+
+    let improvement=oldErr-newErr;
+    const need=colorNeeds(idx);
+
+    let colorNeed=1;
+
+    if(type==="K")colorNeed=0.7+need.darkness*1.45;
+    if(type==="Y")colorNeed=0.35+need.yellowNeed*2.4+need.saturation*0.25;
+    if(type==="R")colorNeed=0.45+need.redNeed*2.25+need.saturation*0.55;
+    if(type==="G")colorNeed=0.45+need.greenNeed*2.25+need.saturation*0.55;
+    if(type==="B")colorNeed=0.45+need.blueNeed*2.25+need.saturation*0.55;
+    if(type==="F")colorNeed=0.75+need.darkness*1.6+edgeMap[idx]*1.25;
+
+    const x=idx%WORK;
+    const y=(idx/WORK)|0;
+
+    const dx=(x-WORK/2)/(WORK/2);
+    const dy=(y-WORK/2)/(WORK/2);
+    const radial=Math.sqrt(dx*dx+dy*dy);
+
+    const center=1+(1-radial)*CENTER_WEIGHT;
+
+    improvement*=1+edgeMap[idx]*EDGE_BOOST;
+    improvement*=1+edgeMap[idx]*need.darkness*DARK_EDGE_BOOST;
+    improvement*=center;
+    improvement*=colorNeed;
+
+    score+=improvement;
+    score-=wrongColorPenalty(type,idx);
+    score-=densityPenalty(type,idx);
+  }
+
+  return score/Math.max(1,pixels.length);
+}
+
+function pinGap(a,b){
+  const n=pins.length;
+  const d=Math.abs(a-b);
+
+  return Math.min(d,n-d);
+}
+
+function getPixels(a,b){
+  const key=a<b?a+"-"+b:b+"-"+a;
+
+  if(lineCache.has(key)){
+    return lineCache.get(key);
+  }
+
+  let x0=Math.round(pins[a].x*WORK/SIZE);
+  let y0=Math.round(pins[a].y*WORK/SIZE);
+  let x1=Math.round(pins[b].x*WORK/SIZE);
+  let y1=Math.round(pins[b].y*WORK/SIZE);
+
+  const pts=[];
+
+  const dx=Math.abs(x1-x0);
+  const dy=-Math.abs(y1-y0);
+  const sx=x0<x1?1:-1;
+  const sy=y0<y1?1:-1;
+
+  let err=dx+dy;
+
+  while(true){
+    if(x0>=0&&y0>=0&&x0<WORK&&y0<WORK){
+      const id=y0*WORK+x0;
+
+      if(mask[id]){
+        pts.push(id);
+      }
+    }
+
+    if(x0===x1&&y0===y1){
+      break;
+    }
+
+    const e2=2*err;
+
+    if(e2>=dy){
+      err+=dy;
+      x0+=sx;
+    }
+
+    if(e2<=dx){
+      err+=dx;
+      y0+=sy;
+    }
+  }
+
+  lineCache.set(key,pts);
+
+  return pts;
+}
+
+function turnPenalty(prev2,prev1,next,recent){
+  if(prev1<0)return 1;
+  if(next===prev1)return 0;
+  if(prev2>=0&&next===prev2)return 0;
+
+  let penalty=1;
+  const gap=parseInt(document.getElementById("gap").value);
+
+  if(pinGap(prev1,next)<gap){
+    penalty*=0.55;
+  }
+
+  for(let i=recent.length-1,age=0;i>=0;i--,age++){
+    if(recent[i]===next){
+      penalty*=Math.max(
+        0.2,
+        1-RECENT_PIN_PENALTY*(RECENT_MEMORY-age)/RECENT_MEMORY
+      );
+    }
+  }
+
+  if(prev2>=0){
+    const ax=pins[prev1].x-pins[prev2].x;
+    const ay=pins[prev1].y-pins[prev2].y;
+
+    const bx=pins[next].x-pins[prev1].x;
+    const by=pins[next].y-pins[prev1].y;
+
+    const al=Math.sqrt(ax*ax+ay*ay)||1;
+    const bl=Math.sqrt(bx*bx+by*by)||1;
+
+    const dot=(ax*bx+ay*by)/(al*bl);
+
+    if(dot<NEAR_REVERSE_DOT){
+      const t=(NEAR_REVERSE_DOT-dot)/(1-NEAR_REVERSE_DOT);
+      penalty*=1-SHARP_TURN_PENALTY*Math.min(1,t);
+    }
+  }
+
+  return penalty;
+}
+
+function addDensity(idx,type){
+  density[idx]++;
+
+  if(type==="K"||type==="F"){
+    densityK[idx]++;
+  }
+
+  if(type==="Y"){
+    densityY[idx]++;
+  }
+
+  if(type==="R"){
+    densityR[idx]++;
+  }
+
+  if(type==="G"){
+    densityG[idx]++;
+  }
+
+  if(type==="B"){
+    densityB[idx]++;
+  }
+}
+
+function drawThread(a,b,type){
+  const width=parseFloat(document.getElementById("threadWidth").value);
+  const alpha=parseFloat(document.getElementById("opacity").value);
+
+  let color="#000";
+
+  if(type==="Y")color="#f7d21e";
+  if(type==="R")color="#ff2a2a";
+  if(type==="G")color="#22cc55";
+  if(type==="B")color="#2d68ff";
+  if(type==="F")color="#000";
+
+  actx.strokeStyle=color;
+  actx.globalAlpha=alpha;
+  actx.lineWidth=width;
+  actx.lineCap="round";
+
+  actx.beginPath();
+  actx.moveTo(pins[a].x,pins[a].y);
+  actx.lineTo(pins[b].x,pins[b].y);
+  actx.stroke();
+
+  actx.globalAlpha=1;
+
+  svgLines.push({
+    a,
+    b,
+    color,
+    alpha,
+    width
+  });
+}
+
+function renderPreview(){
+  const img=actx.createImageData(SIZE,SIZE);
+
+  for(let y=0;y<SIZE;y++){
+    for(let x=0;x<SIZE;x++){
+      const wx=Math.floor(x*WORK/SIZE);
+      const wy=Math.floor(y*WORK/SIZE);
+
+      const id=wy*WORK+wx;
+      const di=(y*SIZE+x)*4;
+
+      if(!mask[id]){
+        img.data[di]=255;
+        img.data[di+1]=255;
+        img.data[di+2]=255;
+        img.data[di+3]=255;
+        continue;
+      }
+
+      const rgb=reconstructRGB(id);
+
+      img.data[di]=rgb[0];
+      img.data[di+1]=rgb[1];
+      img.data[di+2]=rgb[2];
+      img.data[di+3]=255;
+    }
+  }
+
+  actx.putImageData(img,0,0);
+}
+
+async function runPass(type,total,startPin,done,totalLines){
+  const candidates=parseInt(document.getElementById("candidateCount").value);
+  const gap=parseInt(document.getElementById("gap").value);
+
+  let current=startPin;
+  let prev=-1;
+  let prev2=-1;
+  let recent=[current];
+
+  log.push("");
+  log.push("=== "+passName(type)+" ===");
+  log.push("Tie on "+threadName(type)+" thread.");
+
+  for(let l=0;l<total;l++){
+    if(stopFlag){
+      break;
+    }
+
+    let best=-1;
+    let bestScore=-Infinity;
+    let bestPts=null;
+
+    for(let c=0;c<candidates;c++){
+      const next=Math.floor(Math.random()*pins.length);
+
+      if(next===current)continue;
+      if(pinGap(current,next)<gap)continue;
+      if(prev>=0&&next===prev)continue;
+
+      const pts=getPixels(current,next);
+
+      if(pts.length<3)continue;
+
+      const turn=turnPenalty(prev,current,next,recent);
+
+      if(turn<=0)continue;
+
+      const score=lineScore(type,pts)*turn;
+
+      if(score>bestScore){
+        bestScore=score;
+        best=next;
+        bestPts=pts;
+      }
+    }
+
+    if(best<0||!bestPts){
+      current=(current+gap+1)%pins.length;
+      continue;
+    }
+
+    for(const idx of bestPts){
+      applyPixel(idx,type,true);
+      addDensity(idx,type);
+    }
+
+    drawThread(current,best,type);
+
+    log.push((done+l+1)+", "+threadName(type)+", "+current+", "+best);
+
+    prev2=prev;
+    prev=current;
+    current=best;
+
+    recent.push(current);
+
+    if(recent.length>RECENT_MEMORY){
+      recent.shift();
+    }
+
+    if(l%25===0){
+      renderPreview();
+
+      const pct=((done+l+1)/totalLines)*100;
+      bar.style.width=pct.toFixed(1)+"%";
+
+      instructionBox.textContent=log.slice(-260).join("\n");
+      statusEl.textContent=passName(type)+" "+(l+1)+" / "+total;
+
+      await new Promise(requestAnimationFrame);
+    }
+  }
+
+  log.push("Tie off "+threadName(type)+" thread.");
+
+  renderPreview();
+
+  return current;
+}
+
+function passName(type){
+  if(type==="K")return "BLACK VALUE PASS";
+  if(type==="Y")return "YELLOW SUPPORT PASS";
+  if(type==="R")return "RED OPTICAL PASS";
+  if(type==="G")return "GREEN OPTICAL PASS";
+  if(type==="B")return "BLUE OPTICAL PASS";
+  return "BLACK DETAIL REFINEMENT";
+}
+
+function threadName(type){
+  if(type==="K"||type==="F")return "BLACK";
+  if(type==="Y")return "YELLOW";
+  if(type==="R")return "RED";
+  if(type==="G")return "GREEN";
+  if(type==="B")return "BLUE";
+}
+
+async function start(){
+  if(!ready){
+    alert("Upload image first");
+    return;
+  }
+
+  if(running)return;
+
+  running=true;
+  stopFlag=false;
+
+  resetArtOnly();
+  buildPins();
+  drawPins();
+  prepareTarget();
+  hideSource();
+
+  const total=parseInt(document.getElementById("lineCount").value);
+
+  const kLines=Math.floor(total*0.28);
+  const yLines=Math.floor(total*0.12);
+  const rLines=Math.floor(total*0.18);
+  const gLines=Math.floor(total*0.17);
+  const bLines=Math.floor(total*0.17);
+  const fLines=total-(kLines+yLines+rLines+gLines+bLines);
+
+  log.push("K+YRGB PRO OPTICAL STRING ART INSTRUCTIONS");
+
+  if(isSquareMode()){
+    log.push("Square mode: Pin 0 is upper-left. Pins are clockwise.");
+    log.push("For 400 pins: upper-left=0, upper-right=100, lower-right=200, lower-left=300.");
+  }else{
+    log.push("Circle mode: Pin 0 is at top. Pins are clockwise.");
+  }
+
+  log.push("Each pass is continuous. Tie off between passes.");
+  log.push("Pass order: Black → Yellow → Red → Green → Blue → Black Refinement");
+  log.push("Format: step, color, from pin, to pin");
+
+  let cur=0;
+  let done=0;
+
+  cur=await runPass("K",kLines,cur,done,total);
+  done+=kLines;
+
+  cur=await runPass("Y",yLines,cur,done,total);
+  done+=yLines;
+
+  cur=await runPass("R",rLines,cur,done,total);
+  done+=rLines;
+
+  cur=await runPass("G",gLines,cur,done,total);
+  done+=gLines;
+
+  cur=await runPass("B",bLines,cur,done,total);
+  done+=bLines;
+
+  cur=await runPass("F",fLines,cur,done,total);
+  done+=fLines;
+
+  instructionBox.textContent=log.join("\n");
+  bar.style.width="100%";
+
+  statusEl.textContent=stopFlag
+    ? "Stopped. Partial result kept."
+    : "Done.";
+
+  running=false;
+}
+
+function stopRun(){
+  stopFlag=true;
+}
+
+function safeDownload(filename,blob){
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+
+  a.href=url;
+  a.download=filename;
+  a.style.display="none";
+
+  document.body.appendChild(a);
+  a.click();
+
+  setTimeout(()=>{
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },1000);
+}
+
+function downloadPNG(){
+  const out=document.createElement("canvas");
+  out.width=SIZE;
+  out.height=SIZE;
+
+  const c=out.getContext("2d");
+
+  c.fillStyle="white";
+  c.fillRect(0,0,SIZE,SIZE);
+  c.drawImage(art,0,0);
+
+  out.toBlob(blob=>{
+    if(!blob){
+      alert("PNG export failed.");
+      return;
+    }
+
+    safeDownload(
+      isSquareMode()
+        ? "k-yrgb-pro-square-string-art.png"
+        : "k-yrgb-pro-circle-string-art.png",
+      blob
+    );
+  },"image/png");
+}
+
+function downloadSVG(){
+  let s='<svg xmlns="http://www.w3.org/2000/svg" width="'+SIZE+'" height="'+SIZE+'" viewBox="0 0 '+SIZE+' '+SIZE+'">';
+
+  s+='<rect width="100%" height="100%" fill="white"/>';
+
+  if(!isSquareMode()){
+    s+='<circle cx="'+(SIZE/2)+'" cy="'+(SIZE/2)+'" r="'+(SIZE*0.48)+'" fill="none" stroke="#dddddd" stroke-width="1"/>';
+  }else{
+    const margin=SIZE*0.02;
+    s+='<rect x="'+margin+'" y="'+margin+'" width="'+(SIZE-margin*2)+'" height="'+(SIZE-margin*2)+'" fill="none" stroke="#dddddd" stroke-width="1"/>';
+  }
+
+  for(const L of svgLines){
+    const a=pins[L.a];
+    const b=pins[L.b];
+
+    s+='<line x1="'+a.x.toFixed(2)+
+       '" y1="'+a.y.toFixed(2)+
+       '" x2="'+b.x.toFixed(2)+
+       '" y2="'+b.y.toFixed(2)+
+       '" stroke="'+L.color+
+       '" stroke-opacity="'+L.alpha+
+       '" stroke-width="'+L.width+
+       '" stroke-linecap="round"/>';
+  }
+
+  s+='</svg>';
+
+  const blob=new Blob([s],{type:"image/svg+xml"});
+
+  safeDownload(
+    isSquareMode()
+      ? "k-yrgb-pro-square-string-art.svg"
+      : "k-yrgb-pro-circle-string-art.svg",
+    blob
+  );
+}
+
+function downloadTXT(){
+  const text=log.length
+    ? log.join("\n")
+    : "No instructions generated yet.";
+
+  const blob=new Blob([text],{type:"text/plain"});
+
+  safeDownload(
+    isSquareMode()
+      ? "k-yrgb-pro-square-instructions.txt"
+      : "k-yrgb-pro-circle-instructions.txt",
+    blob
+  );
+}
+
+setCanvasShape();
+buildPins();
+drawPins();
+</script>
+</body>
+</html>
